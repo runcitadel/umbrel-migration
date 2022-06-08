@@ -177,61 +177,6 @@ EOF
   }
 }
 
-# Fix broken Nextcloud installs from Umbrel v0.4.0 to be accessible from both
-# <hostname>.local and Tor
-current_umbrel_version=$(cat "${UMBREL_ROOT}/info.json" | jq -r .version)
-nextcloud_config_file="${UMBREL_ROOT}/app-data/nextcloud/data/nextcloud/config/config.php"
-nextcloud_tor_file="${UMBREL_ROOT}/tor/data/app-nextcloud/hostname"
-if [[ "${current_umbrel_version}" = "0.4.0" ]] && [[ -f "${nextcloud_config_file}" ]] && [[ -f "${nextcloud_tor_file}" ]]; then
-  echo
-  echo "Fixing broken Umbrel v0.4.0 Nextcloud install..."
-  nextcloud_hs=$(cat "${nextcloud_tor_file}")
-  nextcloud_local_url="$(hostname -s 2>/dev/null || echo "umbrel").local:8081"
-  sed \
-    -e '/trusted_domains\x27 => $/,/)/!b' \
-    -e '/)/!d;a\  \x27trusted_domains\x27 => array ( 0 => \x27localhost\x27, 1 => \x27'$nextcloud_local_url'\x27, 2 => \x27'$nextcloud_hs'\x27),' \
-    -e 'd' \
-    -i "${nextcloud_config_file}"
-  echo
-fi
-
-# Move Docker data dir to external storage now if this is an old install.
-# This is only needed temporarily until all users have transitioned Docker to SSD.
-DOCKER_DIR="/var/lib/docker"
-MOUNT_POINT="/mnt/data"
-EXTERNAL_DOCKER_DIR="${MOUNT_POINT}/docker"
-if [[ ! -z "${UMBREL_OS:-}" ]] && [[ ! -d "${EXTERNAL_DOCKER_DIR}" ]]; then
-  echo "Attempting to move Docker to external storage..."
-cat <<EOF > "$UMBREL_ROOT"/statuses/update-status.json
-{"state": "installing", "progress": 68, "description": "Migrating Docker install to external storage", "updateTo": "$RELEASE"}
-EOF
-
-  echo "Stopping Docker service..."
-  systemctl stop docker
-
-  # Copy Docker data dir to external storage
-  copy_docker_to_external_storage () {
-    mkdir -p "${EXTERNAL_DOCKER_DIR}"
-    cp  --recursive \
-        --archive \
-        --no-target-directory \
-        "${DOCKER_DIR}" "${EXTERNAL_DOCKER_DIR}"
-  }
-
-  echo "Copying Docker data directory to external storage..."
-  copy_docker_to_external_storage
-
-  echo "Bind mounting external storage over local Docker data dir..."
-  mount --bind "${EXTERNAL_DOCKER_DIR}" "${DOCKER_DIR}"
-
-  # Ensure fs changes are registered
-  sync
-  sleep 1
-
-  echo "Starting Docker service..."
-  systemctl start docker
-fi
-
 # Overlay home dir structure with new dir tree
 echo "Overlaying $UMBREL_ROOT/ with new directory tree"
 rsync --archive \
@@ -264,114 +209,12 @@ EOF
 fi
 
 # Migrate 'apps' structure to using app repos
-"${UMBREL_ROOT}/scripts/update/steps/migrate-to-repo.sh" "$RELEASE" "$UMBREL_ROOT" || {
-  # If the apps migration fails, revert the update to avoid leaving the user in a broken state
-  echo "App migration failed, reverting update!"
-  echo "Error running app migration" > "${UMBREL_ROOT}/statuses/update-failure"
-  rsync -av \
-    --include-from="$UMBREL_ROOT/.umbrel-backup/scripts/update/.updateinclude" \
-    --exclude-from="$UMBREL_ROOT/.umbrel-backup/scripts/update/.updateignore" \
-    "$UMBREL_ROOT"/.umbrel-backup/ \
-    "$UMBREL_ROOT"/
-  ./scripts/start
-  false
-}
-
-# Remove legacy electrs dir
-legacy_electrs_dir="${UMBREL_ROOT}/electrs/db/mainnet"
-if [[ -d "${legacy_electrs_dir}" ]]; then
-  echo "Found legacy electrs dir, removing it..."
-  rm --recursive --force "${legacy_electrs_dir}"
-fi
-
-# Handle updating static assets for samourai-server app
-samourai_app_dir="${UMBREL_ROOT}/apps/samourai-server/nginx"
-samourai_data_dir="${UMBREL_ROOT}/app-data/samourai-server/nginx"
-if [[ -d "${samourai_app_dir}" ]] && [[ -d "${samourai_data_dir}" ]]; then
-  echo "Found samourai-server install, attempting to update static assets and nginx configuration..."
-  rsync --archive --verbose "${samourai_app_dir}/" "${samourai_data_dir}"
-fi
-
-# Handle hidden service migration for samourai-server app
-samourai_app_dojo_tor_dir="${UMBREL_ROOT}/tor/data/app-samourai-server"
-samourai_app_new_dojo_tor_dir="${UMBREL_ROOT}/tor/data/app-samourai-server-dojo"
-if [[ -d "${samourai_app_dojo_tor_dir}" ]] && [[ ! -d "${samourai_app_new_dojo_tor_dir}" ]]; then
-  echo "Found samourai-server install, attempting to migrate dojo hidden service directory..."
-  mv "${samourai_app_dojo_tor_dir}/" "${samourai_app_new_dojo_tor_dir}"
-fi
-
-# Handle updating entrypoint for ride-the-lightning app
-rtl_data_dir="${UMBREL_ROOT}/app-data/ride-the-lightning"
-rtl_data_entrypoint="${rtl_data_dir}/rtl/entrypoint.sh"
-rtl_app_entrypoint="${UMBREL_ROOT}/apps/ride-the-lightning/rtl/entrypoint.sh"
-if [[ -d "${rtl_data_dir}" ]]; then
-  echo "Found ride-the-lightning install, attempting to update entrypoint..."
-  cp "${rtl_app_entrypoint}" "${rtl_data_entrypoint}"
-fi
-
-# Handle new boltz container for ride-the-lightning app
-rtl_data_dir="${UMBREL_ROOT}/app-data/ride-the-lightning"
-rtl_boltz_data_dir="${rtl_data_dir}/boltz"
-if [[ -d "${rtl_data_dir}" ]] && [[ ! -d "${rtl_boltz_data_dir}" ]]; then
-  echo "Found ride-the-lightning install without boltz data dir, attempting to create it..."
-  mkdir "${rtl_boltz_data_dir}"
-  chown 1000:1000 "${rtl_boltz_data_dir}"
-fi
-
-# Handle updating entrypoint for thunderhub app
-thunderhub_data_dir="${UMBREL_ROOT}/app-data/thunderhub"
-thunderhub_data_entrypoint="${thunderhub_data_dir}/data/entrypoint.sh"
-thunderhub_app_entrypoint="${UMBREL_ROOT}/apps/thunderhub/data/entrypoint.sh"
-if [[ -d "${thunderhub_data_dir}" ]]; then
-  echo "Found thunderhub install, attempting to update entrypoint..."
-  cp "${thunderhub_app_entrypoint}" "${thunderhub_data_entrypoint}"
-fi
-
-# Handle stripping hardcoded password for lightning-terminal app
-lightning_terminal_conf="${UMBREL_ROOT}/app-data/lightning-terminal/data/.lit/lit.conf"
-if [[ -f "${lightning_terminal_conf}" ]]; then
-  echo "Found lightning-terminal install, attempting to strip hardcoded password..."
-  sed -i 's/uipassword=moneyprintergobrrr//' "${lightning_terminal_conf}"
-fi
-
-# Handle new logs dir for krystal-bull app
-krystal_bull_data_dir="${UMBREL_ROOT}/app-data/krystal-bull"
-krystal_bull_logs_data_dir="${krystal_bull_data_dir}/data/log"
-if [[ -d "${krystal_bull_data_dir}" ]] && [[ ! -d "${krystal_bull_logs_data_dir}" ]]; then
-  echo "Found krystal-bull install without log data dir, attempting to create it..."
-  mkdir "${krystal_bull_logs_data_dir}"
-  chown 1000:1000 "${krystal_bull_logs_data_dir}"
-fi
-
-# Handle new data dirs for kollider app
-kollider_data_dir="${UMBREL_ROOT}/app-data/kollider"
-kollider_logs_data_dir="${kollider_data_dir}/data/logs"
-kollider_image_cache_data_dir="${kollider_data_dir}/data/cache/images"
-if [[ -d "${kollider_data_dir}" ]] && [[ ! -d "${kollider_logs_data_dir}" ]]; then
-  echo "Found kollider install without data dirs, attempting to create them..."
-  mkdir -p "${kollider_logs_data_dir}"
-  chown 1000:1000 "${kollider_logs_data_dir}"
-  mkdir -p "${kollider_image_cache_data_dir}"
-  chown 1000:1000 "${kollider_image_cache_data_dir}"
-fi
+"${UMBREL_ROOT}/scripts/update/steps/migrate-to-repo.sh" "$RELEASE" "$UMBREL_ROOT"
 
 # Fix permissions
 echo "Fixing permissions"
 find "$UMBREL_ROOT" -path "$UMBREL_ROOT/app-data" -prune -o -exec chown 1000:1000 {} +
 chmod -R 700 "$UMBREL_ROOT"/tor/data/*
-
-# Start updated containers
-echo "Starting new containers"
-cat <<EOF > "$UMBREL_ROOT"/statuses/update-status.json
-{"state": "installing", "progress": 80, "description": "Starting new containers", "updateTo": "$RELEASE"}
-EOF
-cd "$UMBREL_ROOT"
-./scripts/start
-
-# Delete obselete backup lock file
-# https://github.com/getumbrel/umbrel/pull/213
-# Remove this in the next breaking update
-[[ -f "${UMBREL_ROOT}/statuses/backup-in-progress" ]] && rm -f "${UMBREL_ROOT}/statuses/backup-in-progress"
 
 # Make Umbrel OS specific post-update changes
 if [[ ! -z "${UMBREL_OS:-}" ]]; then
